@@ -1,0 +1,19 @@
+html, body { height: 100%; margin: 0; background: #071226; color: #dfeeff; font-family: system-ui, Arial; }
+.wrap { display: flex; height: 100vh; }
+.left { flex: 1; padding: 8px; }
+.right { width: 360px; background: #04141f; padding: 12px; border-left: 1px solid #063248; box-sizing: border-box; }
+#chart { height: calc(100vh - 24px); }
+.row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+label { width: 120px; color: #9fc7db; }
+input[type=number], select { background: #07212a; border: 1px solid #063248; padding: 6px 8px; border-radius: 6px; color: #dfeeff; }
+button { background: #2dd4bf; border: none; padding: 8px 10px; border-radius: 6px; color: #042; font-weight: 700; cursor: pointer; }
+.muted { color: #9fc7db; font-size: 13px; }
+.trades { margin-top: 12px; background: #021418; padding: 8px; border-radius: 6px; max-height: 40vh; overflow: auto; }
+.summary { margin-top: 12px; background: #021418; padding: 8px; border-radius: 6px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 6px 8px; border-bottom: 1px dashed rgba(255,255,255,0.03); text-align: left; }
+th { color: #9fc7db; }
+.L { color: #7cf2a6; font-weight: 700; }
+.S { color: #ff9b9b; font-weight: 700; }
+.positive { color: #7cf2a6; }
+.negative { color: #ff9b9b; }

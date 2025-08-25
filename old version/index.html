@@ -1,0 +1,493 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EMA-RSI Walkforward Visualizer — Fixed</title>
+
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    html,body{height:100%;margin:0;background:#071226;color:#dfeeff;font-family:system-ui,Arial}
+    .wrap{display:flex;height:100vh}
+    .left{flex:1;padding:8px;display:flex;flex-direction:column;gap:8px}
+    .chart-wrap{flex:1;display:flex;flex-direction:column;gap:8px}
+    .chart-top{height:calc(70% - 8px);background:#071226;border-radius:6px;overflow:hidden}
+    .chart-bottom{height:calc(30% - 8px);background:#071226;border-radius:6px;overflow:hidden}
+    .right{width:360px;background:#04141f;padding:12px;border-left:1px solid #063248;box-sizing:border-box;display:flex;flex-direction:column}
+    #priceChart{height:100%}
+    #equityChart{height:100%}
+    .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    label{width:120px;color:#9fc7db}
+    input[type=number], select {background:#07212a;border:1px solid #063248;padding:6px 8px;border-radius:6px;color:#dfeeff}
+    button{background:#2dd4bf;border:none;padding:8px 10px;border-radius:6px;color:#042;font-weight:700;cursor:pointer}
+    .muted{color:#9fc7db;font-size:13px}
+    .trades{margin-top:8px;background:#021418;padding:8px;border-radius:6px;max-height:36vh;overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{padding:6px 8px;border-bottom:1px dashed rgba(255,255,255,0.03);text-align:left}
+    th{color:#9fc7db}
+    .L{color:#7cf2a6;font-weight:700}
+    .S{color:#ff9b9b;font-weight:700}
+    .stat{margin-bottom:6px}
+    .warn{color:#ffcc66;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left">
+      <div class="chart-wrap">
+        
+        <div id="pricePanel" class="chart-top"><div id="priceChart" style="height:100%"></div></div>
+        <div id="equityPanel" class="chart-bottom"><div id="equityChart" style="height:100%"></div></div>
+      </div>
+    </div>
+
+
+    <div class="right">
+      <div class="row">
+        <div style="font-weight:700">EMA(9/21) + Intrahour Signals (backend)</div>
+        <div style="margin-left:auto" class="muted">Backend computes EMAs & signals</div>
+      </div>
+
+      <div class="row"><label>Mode</label>
+        <select id="mode">
+  <option value="backtest">Hourly Backtest (new intraminute method — server /walkforward)</option>
+  <option value="conventional">Conventional Hourly Backtest (server /walkforward?method=conventional)</option>
+  <option value="intrahour">Intrahour Signals (server /intraminute_backtest)</option>
+  <option value="live">Live (poll intrahour & POST /place_order)</option>
+</select>
+
+<div class="row"><label>Start (UTC ISO)</label><input id="startISO" type="text" value="2025-08-01T12:00:00Z" /></div>
+<div class="row"><label>End (UTC ISO)</label><input id="endISO" type="text" value="2026-09-01T00:00:00Z" /></div>
+
+      </div>
+
+      <div class="row"><label>Days</label><input id="days" type="number" value="2" min="1" /></div>
+      <div class="row"><label>Short EMA</label><input id="short" type="number" value="9" min="1" /></div>
+      <div class="row"><label>Long EMA</label><input id="long" type="number" value="21" min="1" /></div>
+
+      <div class="row"><label>Initial capital</label><input id="initCapital" type="number" value="1000" /></div>
+      <div class="row"><label>Fee %</label><input id="fee" type="number" step="0.01" value="0.1" /></div>
+
+      <div class="row">
+        <button id="runBtn">Run</button>
+        <button id="stopBtn" style="background:#ff7b7b;margin-left:6px">Stop</button>
+      </div>
+
+      <div id="seedWarn" class="muted" style="margin-bottom:6px"></div>
+      <div id="statsBox" class="muted"></div>
+
+      <div style="margin-top:8px" class="muted">Trades / Signals</div>
+      <div class="trades">
+        <table id="tradesTable">
+          <thead><tr><th>#</th><th>Type</th><th>Time</th><th>Price</th><th>P&L</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+(async function(){
+  // ---------- CONFIG ----------
+  const BASE = "http://127.0.0.1:8000"; // change if needed
+  const endpoints = {
+    candles: (resolution, days, symbol = 'BTCUSDT') => `${BASE}/candles?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&days=${encodeURIComponent(days)}`,
+    walkforward: (params) => `${BASE}/walkforward?` + new URLSearchParams(params).toString(),
+    intraminute: (params) => `${BASE}/intraminute_backtest?` + new URLSearchParams(params).toString(),
+    placeOrder: `${BASE}/place_order`
+  };
+
+  // ---------- utilities ----------
+  const $ = sel => document.querySelector(sel);
+  const formatTime = ts => new Date(Number(ts) * 1000).toLocaleString();
+
+  // ---------- charts ----------
+  const priceChart = LightweightCharts.createChart(document.getElementById('priceChart'), {
+    layout:{background:'#071226', textColor:'#dfeeff'},
+    grid:{vertLines:{color:'rgba(255,255,255,0.03)'}, horzLines:{color:'rgba(255,255,255,0.03)'}},
+    rightPriceScale:{borderColor:'#063248'},
+    timeScale:{timeVisible:true, secondsVisible:false}
+  });
+  const candleSeries = priceChart.addSeries(LightweightCharts.CandlestickSeries);
+  const emaShortSeries = priceChart.addSeries(LightweightCharts.LineSeries, { lineWidth:1.5 });
+  const emaLongSeries  = priceChart.addSeries(LightweightCharts.LineSeries, { lineWidth:1.5 });
+
+  const equityChart = LightweightCharts.createChart(document.getElementById('equityChart'), {
+    layout:{background:'#071226', textColor:'#dfeeff'},
+    rightPriceScale:{borderColor:'#063248'},
+    timeScale:{timeVisible:true, secondsVisible:false}
+  });
+  const equitySeries = equityChart.addSeries(LightweightCharts.LineSeries, { priceFormat:{type:'price', precision:2}, lineWidth:2 });
+
+  // ---------- UI refs ----------
+  const runBtn = $('#runBtn');
+  const stopBtn = $('#stopBtn');
+  const modeSel = $('#mode');
+  const daysIn = $('#days');
+  const shortIn = $('#short');
+  const longIn = $('#long');
+  const initCapIn = $('#initCapital');
+  const feeIn = $('#fee');
+  const tradesTbody = document.querySelector('#tradesTable tbody');
+  const seedWarn = $('#seedWarn');
+  const statsBox = $('#statsBox');
+
+  let pollInterval = null;
+  let lastPlacedSignalIds = new Set();
+
+  // ---------- render helpers ----------
+  function renderTrades(trades, mode) {
+    tradesTbody.innerHTML = '';
+    if (!trades || trades.length === 0) {
+      tradesTbody.innerHTML = '<tr><td colspan="5" class="muted">No trades / signals</td></tr>';
+      return;
+    }
+    trades.forEach((t, i) => {
+      const tr = document.createElement('tr');
+      const kind = t.type || t.side || (t.entry_time ? 'trade' : 'signal');
+      const time = t.minute_time || t.entry_time || t.time || t.hour_time || '';
+      const price = (t.entry_price || t.exit_price || t.price || t.close || t.ema_short || '');
+      const pnl = (t.pnl !== undefined ? (t.pnl>=0?'+':'') + Number(t.pnl).toFixed(2) : '');
+      tr.innerHTML = `<td>${i+1}</td>
+        <td>${kind}</td>
+        <td>${time ? formatTime(time) : '-'}</td>
+        <td>${price !== '' ? Number(price).toFixed(2) : '-'}</td>
+        <td>${pnl}</td>`;
+      tradesTbody.appendChild(tr);
+    });
+  }
+
+  // Compatibility helper to set markers on a series (works with multiple LC versions)
+  function setSeriesMarkers(series, markers) {
+    if (!series) return;
+    // prefer the instance method if available (older builds)
+    if (typeof series.setMarkers === 'function') {
+      try {
+        series.setMarkers(markers);
+        return;
+      } catch (e) {
+        console.warn('series.setMarkers failed, falling back to createSeriesMarkers', e);
+      }
+    }
+    // fallback to the library helper (newer builds)
+    if (typeof LightweightCharts !== 'undefined' && typeof LightweightCharts.createSeriesMarkers === 'function') {
+      try {
+        LightweightCharts.createSeriesMarkers(series, markers);
+        return;
+      } catch (e) {
+        console.warn('createSeriesMarkers failed', e);
+      }
+    }
+    console.warn('Cannot set markers: no supported API found on LightweightCharts instance/series.');
+  }
+
+  function attachMarkersFromSignals(signals) {
+    if (!signals || signals.length === 0) {
+      setSeriesMarkers(candleSeries, []);
+      return;
+    }
+    const m = signals.map(s => {
+      const isBuy = (s.type === 'buy' || s.type === 'long');
+      return {
+        time: s.minute_time || s.time || s.hour_time,
+        position: isBuy ? 'belowBar' : 'aboveBar',
+        color: isBuy ? '#7cf2a6' : '#ff9b9b',
+        shape: 'circle',
+        text: isBuy ? 'B' : 'S'
+      };
+    });
+    setSeriesMarkers(candleSeries, m);
+  }
+
+  // ---------- network ----------
+  async function fetchJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json();
+  }
+
+  async function postJSON(url, body) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.json();
+  }
+
+  // ---------- EMA fallback (client-side) ----------
+  function computeAndDrawEMAFromHourly(hourly, period, series) {
+    if (!hourly || hourly.length === 0) return;
+    const closes = hourly.map(h=>h.close);
+    const out = [];
+    const n = closes.length;
+    const k = 2/(period+1);
+    if (n < period) {
+      let ema = closes[0];
+      for (let i=1;i<n;i++){
+        ema = closes[i]*k + ema*(1-k);
+        out.push({ time: hourly[i].time, value: ema });
+      }
+    } else {
+      let seed = 0;
+      for (let i=0;i<period;i++) seed += closes[i];
+      seed = seed/period;
+      let ema = seed;
+      out.push({ time: hourly[period-1].time, value: ema });
+      for (let i=period;i<n;i++){
+        ema = closes[i]*k + ema*(1-k);
+        out.push({ time: hourly[i].time, value: ema });
+      }
+    }
+    series.setData(out);
+  }
+
+  // ---------- core: run once depending on mode ----------
+  async function runStrategyOnce(opts) {
+    const mode = opts.mode;
+    const symbol = opts.symbol || 'BTCUSDT';
+
+    // 1) always fetch hourly candles for base chart visualization
+    const hourlyResp = await fetchJSON(endpoints.candles('60', opts.days, symbol));
+    const hourly = (hourlyResp.candles || []).map(c => ({
+      time: c.time, open: +c.open, high: +c.high, low: +c.low, close: +c.close, volume: +c.volume
+    }));
+
+    // show seed warning if not enough bars
+    const maxPeriod = Math.max(opts.short, opts.long);
+    if (hourly.length < maxPeriod * 3) {
+      seedWarn.innerHTML = `<div class="warn">Only ${hourly.length} hourly bars — recommended >= ${maxPeriod*3} for stable seeding</div>`;
+    } else {
+      seedWarn.innerHTML = `<div class="muted">Seed history: ${hourly.length} hourly bars</div>`;
+    }
+
+    // plot hourly candles
+    if (hourly.length) {
+      candleSeries.setData(hourly);
+      priceChart.timeScale().fitContent();
+    }
+
+// ---------- BACKTEST (hourly walkforward) ----------
+const startISO = document.getElementById('startISO').value.trim();
+const endISO   = document.getElementById('endISO').value.trim();
+if (mode === 'conventional') {
+  backParams.method = 'conventional';
+  // Convert ISO to epoch seconds if provided
+  if (startISO) backParams.start_ts = Math.floor(new Date(startISO).getTime() / 1000);
+  if (endISO) backParams.end_ts = Math.floor(new Date(endISO).getTime() / 1000);
+}
+
+if (mode === 'backtest' || mode === 'conventional') {
+  // map UI -> server.py walkforward params
+  const hoursWindow = (opts.hours && Number(opts.hours)) || Math.max(12, opts.days * 24);
+  const backParams = {
+    symbol: symbol,
+    hours: hoursWindow,
+    fast: opts.short,
+    slow: opts.long,
+    rsi_len: opts.rsi_len || 14,
+    rsi_ob: opts.rsi_ob || 65.0,
+    rsi_os: opts.rsi_os || 35.0,
+    initial_capital: opts.initial_capital,
+    fee_pct: opts.fee_pct,
+    position_size_pct: opts.position_size_pct || 1.0,
+    days_back_for_history: opts.days
+  };
+
+  // if user selected the "conventional" mode, add method param
+  if (mode === 'conventional') backParams.method = 'conventional';
+
+  const j = await fetchJSON(endpoints.walkforward(backParams));
+  const trades = j.trades || [];
+  const markers = j.markers || [];
+  const equity = j.equity || [];
+  const stats = j.stats || {};
+
+  if (j.method === 'conventional') {
+  if (j.fast_ema && j.slow_ema && j.hourly) {
+    const sdata = j.fast_ema.map((v,i) => ({ time: j.hourly[i].time, value: v })).filter(x=>x.value!=null);
+    const ldata = j.slow_ema.map((v,i) => ({ time: j.hourly[i].time, value: v })).filter(x=>x.value!=null);
+    emaShortSeries.setData(sdata);
+    emaLongSeries.setData(ldata);
+  } else {
+    computeAndDrawEMAFromHourly(hourly, opts.short, emaShortSeries);
+    computeAndDrawEMAFromHourly(hourly, opts.long, emaLongSeries);
+  }
+  // optionally show RSI as a separate chart or log signals
+  // j.signals contains long_now/short_now at each bar and long_signal/short_signal (executed on next bar)
+}
+
+
+  const mappedMarkers = (markers || []).map(m => ({
+    time: m.time,
+    position: m.position || 'belowBar',
+    color: m.color || (m.text === 'L' ? '#7cf2a6' : '#ff9b9b'),
+    shape: m.shape || 'circle',
+    text: m.text || (m.position === 'belowBar' ? 'L' : 'S')
+  }));
+  setSeriesMarkers(candleSeries, mappedMarkers);
+
+  equitySeries.setData((equity || []).map(e => ({ time: e.time, value: e.equity })));
+  equityChart.timeScale().fitContent();
+
+  // optionally plot EMA arrays returned by conventional method
+  if (j.fast_ema && j.slow_ema) {
+    // convert to LC series data (only include numerical entries)
+    const sdata = j.fast_ema.map((v,i) => ({ time: j.hourly[i].time, value: isNaN(v) ? null : v })).filter(x=>x.value!=null);
+    const ldata = j.slow_ema.map((v,i) => ({ time: j.hourly[i].time, value: isNaN(v) ? null : v })).filter(x=>x.value!=null);
+    emaShortSeries.setData(sdata);
+    emaLongSeries.setData(ldata);
+  } else {
+    computeAndDrawEMAFromHourly(hourly, opts.short, emaShortSeries);
+    computeAndDrawEMAFromHourly(hourly, opts.long, emaLongSeries);
+  }
+
+  renderTrades(trades, 'backtest');
+
+  statsBox.innerHTML = `<div class="stat">Trades: ${stats.trades || trades.length}</div>
+    <div class="stat">Net PnL: ${ (stats.net_profit||0).toFixed(2) }</div>
+    <div class="stat">Final Equity: ${ (stats.final_equity||0).toFixed(2) }</div>
+    <div class="stat">Max Drawdown: ${ (stats.max_drawdown_pct||0).toFixed(2) }%</div>`;
+
+  return { type:'backtest', trades, equity, stats };
+}
+
+
+    // ---------- INTRAHOUR / LIVE ----------
+    if (mode === 'intrahour' || mode === 'live') {
+      const p = {
+        symbol: symbol,
+        days: opts.days,
+        fast: opts.short,
+        slow: opts.long,
+        rsi_len: opts.rsi_len || 14,
+        rsi_ob: opts.rsi_ob || 65.0,
+        rsi_os: opts.rsi_os || 35.0,
+        initial_capital: opts.initial_capital,
+        fee_pct: opts.fee_pct,
+        position_size_pct: opts.position_size_pct || 1.0
+      };
+
+      const j = await fetchJSON(endpoints.intraminute(p));
+
+      const h = j.hourly || [];
+      const minute_current = j.minute_current_hour || [];
+      const trades = j.trades || [];
+      const markers = j.markers || [];
+      const equity = j.equity || [];
+      const stats = j.stats || {};
+      const emas = j.emas || [];
+
+      if (h.length) {
+        const hh = h.map(c => ({ time: c.time, open:+c.open, high:+c.high, low:+c.low, close:+c.close }));
+        candleSeries.setData(hh);
+        priceChart.timeScale().fitContent();
+      }
+
+      if (emas && emas.length) {
+        const sdata = emas.map(e => ({ time: e.time, value: e.ema_short })).filter(x=>!isNaN(x.value));
+        const ldata = emas.map(e => ({ time: e.time, value: e.ema_long })).filter(x=>!isNaN(x.value));
+        emaShortSeries.setData(sdata);
+        emaLongSeries.setData(ldata);
+      } else {
+        computeAndDrawEMAFromHourly(hourly, opts.short, emaShortSeries);
+        computeAndDrawEMAFromHourly(hourly, opts.long, emaLongSeries);
+      }
+
+      const mappedMarkers2 = (markers || []).map(m => ({
+        time: m.time,
+        position: m.position || 'belowBar',
+        color: m.color || (m.text === 'L' ? '#7cf2a6' : '#ff9b9b'),
+        shape: m.shape || 'circle',
+        text: m.text || (m.position === 'belowBar' ? 'L' : 'S')
+      }));
+      setSeriesMarkers(candleSeries, mappedMarkers2);
+
+      equitySeries.setData((equity || []).map(e => ({ time: e.time, value: e.equity })));
+      equityChart.timeScale().fitContent();
+
+      renderTrades(trades.length ? trades : (j.signals || []), 'intrahour');
+
+      statsBox.innerHTML = `<div class="stat">Trades/Signals: ${ (trades.length || (j.signals||[]).length) }</div>
+        <div class="stat">Final Equity: ${ (stats.final_equity||0).toFixed(2) }</div>
+        <div class="stat">Max Drawdown: ${ (stats.max_drawdown_pct||0).toFixed(2) }%</div>`;
+
+      if (mode === 'live' && markers && markers.length) {
+        const newly = markers.filter(m => {
+          const id = `${m.time}_${m.text || ''}`;
+          if (lastPlacedSignalIds.has(id)) return false;
+          lastPlacedSignalIds.add(id);
+          return true;
+        });
+        for (const s of newly) {
+          const payload = {
+            symbol: symbol,
+            action: s.position === 'aboveBar' ? 'close' : 'open',
+            side: (s.text === 'L' || s.text === 'B') ? 'long' : 'short',
+            time: s.time
+          };
+          try { await postJSON(endpoints.placeOrder, payload); } catch(e){ console.warn('place_order failed', e); }
+        }
+      }
+
+      return { type:'intrahour', trades, markers, equity, stats };
+    }
+
+    throw new Error('unknown mode: ' + mode);
+  }
+
+  // ---------- run/stop controls & polling ----------
+  let isRunning = false;
+  runBtn.addEventListener('click', async () => {
+    if (isRunning) return;
+    isRunning = true;
+    runBtn.disabled = true;
+    seedWarn.textContent = '';
+    statsBox.textContent = '';
+    tradesTbody.innerHTML = '<tr><td colspan="5" class="muted">Loading…</td></tr>';
+
+    const opts = {
+      mode: modeSel.value,
+      days: Number(daysIn.value) || 2,
+      short: Number(shortIn.value) || 9,
+      long: Number(longIn.value) || 21,
+      initial_capital: Number(initCapIn.value) || 1000,
+      fee_pct: Number(feeIn.value) || 0.1,
+      rsi_len: 14,
+      rsi_ob: 65.0,
+      rsi_os: 35.0,
+      position_size_pct: 1.0,
+      symbol: 'BTCUSDT'
+    };
+
+    try {
+      await runStrategyOnce(opts);
+
+      if (opts.mode === 'live') {
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(() => runStrategyOnce(opts).catch(err => console.warn('live poll error', err)), 60_000);
+      }
+    } catch (err) {
+      alert('Run failed: ' + (err.message || err));
+      console.error(err);
+    } finally {
+      runBtn.disabled = false;
+      isRunning = false;
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    if (pollInterval) clearInterval(pollInterval);
+    pollInterval = null;
+    seedWarn.textContent = '';
+    statsBox.textContent = '';
+    runBtn.disabled = false;
+    isRunning = false;
+  });
+
+})(); // IIFE
+</script>
+
+</body>
+</html>

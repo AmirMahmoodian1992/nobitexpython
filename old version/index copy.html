@@ -1,0 +1,377 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EMA-RSI Live Exec (execute on candle close)</title>
+
+  <script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    html,body{height:100%;margin:0;background:#071226;color:#dfeeff;font-family:system-ui,Arial}
+    .wrap{display:flex;height:100vh}
+    .left{flex:1;padding:8px}
+    .right{width:360px;background:#04141f;padding:12px;border-left:1px solid #063248;box-sizing:border-box}
+    #chart{height:calc(100vh - 24px)}
+    .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    label{width:120px;color:#9fc7db}
+    input[type=number], select {background:#07212a;border:1px solid #063248;padding:6px 8px;border-radius:6px;color:#dfeeff}
+    button{background:#2dd4bf;border:none;padding:8px 10px;border-radius:6px;color:#042;font-weight:700;cursor:pointer}
+    .muted{color:#9fc7db;font-size:13px}
+    .trades{margin-top:12px;background:#021418;padding:8px;border-radius:6px;max-height:50vh;overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{padding:6px 8px;border-bottom:1px dashed rgba(255,255,255,0.03);text-align:left}
+    th{color:#9fc7db}
+    .L{color:#7cf2a6;font-weight:700}
+    .S{color:#ff9b9b;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left">
+      <div id="chart"></div>
+    </div>
+
+    <div class="right">
+      <div class="row">
+        <div style="font-weight:700">EMA(9/21) + RSI live exec</div>
+        <div style="margin-left:auto" class="muted">Execute on candle close</div>
+      </div>
+
+      <div class="row"><label>Fast EMA</label><input id="fast" type="number" value="9" min="1" /></div>
+      <div class="row"><label>Slow EMA</label><input id="slow" type="number" value="21" min="1" /></div>
+      <div class="row"><label>RSI length</label><input id="rsiLen" type="number" value="14" min="1" /></div>
+      <div class="row"><label>RSI overbought</label><input id="rsiOB" type="number" value="65" /></div>
+      <div class="row"><label>RSI oversold</label><input id="rsiOS" type="number" value="35" /></div>
+
+      <div class="row"><label>Initial capital</label><input id="initCapital" type="number" value="1000" /></div>
+      <div class="row"><label>Fee %</label><input id="fee" type="number" step="0.01" value="0.1" /></div>
+
+      <div class="row">
+        <label>Mode</label>
+        <select id="mode">
+          <option value="simulate">Simulate (local)</option>
+          <option value="live">Live (POST /place_order)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <button id="startBtn">Run Strategy</button>
+        <button id="stopBtn" style="background:#ff7b7b;margin-left:6px">Stop</button>
+      </div>
+
+      <div style="margin-top:12px" class="muted">Trades (entry then exit rows)</div>
+      <div class="trades">
+        <table id="tradesTable">
+          <thead><tr><th>#</th><th>Side</th><th>Time</th><th>Price</th><th>P&L</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+(async function(){
+  // ---------- helpers ----------
+  const apiCandles = "http://127.0.0.1:8000/candles?symbol=BTCIRT&resolution=60&days=30";
+  // If you use different symbol/resolution, change apiCandles accordingly.
+
+  const log = (...a)=>console.log(...a);
+  const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+  // ---------- chart setup ----------
+  if (!window.LightweightCharts) { alert("LightweightCharts missing"); return; }
+  const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+    layout:{background:'#071226', textColor:'#dfeeff'},
+    timeScale:{timeVisible:true, secondsVisible:false}
+  });
+
+  const candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries);
+  const fastSeries = chart.addSeries(LightweightCharts.LineSeries, { color:'#58a6ff', lineWidth:1.5 });
+  const slowSeries = chart.addSeries(LightweightCharts.LineSeries, { color:'#ffb86b', lineWidth:1.5 });
+
+  window.candleSeries = candleSeries; // expose for console/debug
+
+  // ---------- fetch candles ----------
+  let candles = [];
+  try {
+    const r = await fetch(apiCandles);
+    const j = await r.json();
+    candles = (j.candles || []).map(c => ({ time: c.time, open:+c.open, high:+c.high, low:+c.low, close:+c.close }));
+  } catch (e) {
+    alert("Failed to fetch candles: " + e.message);
+    return;
+  }
+  if (!candles.length) { alert("No candles"); return; }
+
+  candleSeries.setData(candles);
+  chart.timeScale().fitContent();
+
+  // ---------- indicator functions ----------
+  function emaSeries(values, period) {
+    const out = new Array(values.length).fill(null);
+    if (values.length === 0) return out;
+    if (values.length <= period) {
+      // simple seed
+      out[0] = values[0];
+      const k = 2/(period+1);
+      for (let i=1;i<values.length;i++) out[i]=values[i]*k + out[i-1]*(1-k);
+      return out;
+    }
+    let sum=0;
+    for (let i=0;i<period;i++) sum+=values[i];
+    out[period-1] = sum/period;
+    const k = 2/(period+1);
+    for (let i=period;i<values.length;i++) out[i] = values[i]*k + out[i-1]*(1-k);
+    return out;
+  }
+  function rsi_wilder(prices, period=14){
+    const out = new Array(prices.length).fill(null);
+    if (prices.length <= period) return out;
+    const deltas = [];
+    for (let i=1;i<prices.length;i++) deltas.push(prices[i]-prices[i-1]);
+    let up=0, down=0;
+    for (let i=0;i<period;i++){ const d=deltas[i]; if (d>0) up+=d; else down+=-d; }
+    let avgUp = up/period, avgDown = down/period;
+    out[period] = 100 - 100/(1 + (avgUp/(avgDown||1e-8)));
+    for (let i=period+1;i<prices.length;i++){
+      const d = deltas[i-1];
+      const gain = d>0?d:0;
+      const loss = d<0?-d:0;
+      avgUp = (avgUp*(period-1)+gain)/period;
+      avgDown = (avgDown*(period-1)+loss)/period;
+      out[i] = 100 - 100/(1 + (avgUp/(avgDown||1e-8)));
+    }
+    return out;
+  }
+
+  // ---------- state for simulation/live run ----------
+  let running = false;
+  let trades = []; // completed trades
+  let currentPos = null; // { side:'long'|'short', entry_time, entry_price, units, entry_fee }
+  let seriesMarkers = null;
+
+  // ---------- UI elements ----------
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const fastIn = document.getElementById('fast');
+  const slowIn = document.getElementById('slow');
+  const rsiLenIn = document.getElementById('rsiLen');
+  const rsiOBIn = document.getElementById('rsiOB');
+  const rsiOSIn = document.getElementById('rsiOS');
+  const initCapIn = document.getElementById('initCapital');
+  const feeIn = document.getElementById('fee');
+  const modeSel = document.getElementById('mode');
+  const tradesTbody = document.querySelector('#tradesTable tbody');
+
+  function renderTrades() {
+    tradesTbody.innerHTML = '';
+    if (!trades.length) {
+      tradesTbody.innerHTML = '<tr><td colspan="5" class="muted">No trades yet</td></tr>';
+      return;
+    }
+    let idx=0;
+    for (const t of trades) {
+      idx++;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${idx}</td><td>${t.side === 'long' ? '<span class="L">L</span>' : '<span class="S">S</span>'}</td>
+        <td>${new Date(t.entry_time*1000).toLocaleString()}</td>
+        <td>${t.entry_price.toFixed(2)}</td>
+        <td>${(t.pnl>=0?'+':'') + t.pnl.toFixed(2)}</td>`;
+      tradesTbody.appendChild(tr);
+
+      // exit row
+      const tr2 = document.createElement('tr');
+      tr2.innerHTML = `<td></td><td></td>
+        <td>${new Date(t.exit_time*1000).toLocaleString()}</td>
+        <td>${t.exit_price.toFixed(2)}</td>
+        <td></td>`;
+      tradesTbody.appendChild(tr2);
+    }
+  }
+
+  function attachMarkersFromTrades(tradesArray){
+    const markers = [];
+    for (const t of tradesArray) {
+      markers.push({ time: t.entry_time, position:'belowBar', color: t.side==='long' ? 'green' : 'red', shape:'circle', text: t.side==='long'?'L':'S' });
+      markers.push({ time: t.exit_time, position:'aboveBar', color: t.side==='long' ? 'green' : 'red', shape:'circle', text: t.side==='long'?'L':'S' });
+    }
+    if (typeof LightweightCharts.createSeriesMarkers === 'function') {
+      if (seriesMarkers) seriesMarkers.setMarkers(markers);
+      else seriesMarkers = LightweightCharts.createSeriesMarkers(candleSeries, markers);
+    }
+  }
+
+  // ---------- optional: real order call to backend ----------
+  // Expected endpoint: POST /place_order with JSON { side:'long'|'short'|'close', price, size }
+  // WARNING: THIS IS A TRIVIAL EXAMPLE. For real trading you MUST sign requests,
+  // include API keys, handle network retries, confirm orders, and add rate-limiting, and test thoroughly.
+  async function placeOrderToBackend(payload) {
+    const url = 'http://127.0.0.1:8000/place_order'; // implement server endpoint below
+    try {
+      const r = await fetch(url, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error('order failed: ' + txt);
+      }
+      const res = await r.json();
+      return res;
+    } catch (err) {
+      console.error('placeOrderToBackend error', err);
+      throw err;
+    }
+  }
+
+  // ---------- core executor: acts on crossover at CLOSE ----------
+  // Semantics:
+  // - At bar i closure compute fastEMA[i], slowEMA[i], rsi[i].
+  // - If crossover condition and RSI condition true at i:
+  //     - If no position => OPEN at price = close[i]
+  //     - If opposite position exists => CLOSE at price = close[i], then OPEN opposite at price = close[i]
+  // - Markers use short text 'L' or 'S'.
+  async function runStrategyOnce() {
+    const fast = Number(fastIn.value) || 9;
+    const slow = Number(slowIn.value) || 21;
+    const rsiLen = Number(rsiLenIn.value) || 14;
+    const rsiOB = Number(rsiOBIn.value) || 65;
+    const rsiOS = Number(rsiOSIn.value) || 35;
+    const initialCapital = Number(initCapIn.value) || 1000;
+    const feePct = Number(feeIn.value) || 0.1;
+    const mode = modeSel.value;
+
+    // compute indicators over full fetched candles
+    const closes = candles.map(c=>c.close);
+    const fastEMA = emaSeries(closes, fast);
+    const slowEMA = emaSeries(closes, slow);
+    const rsi = rsi_wilder(closes, rsiLen);
+
+    // iterate bars in chronological order and simulate "live" stepping at each close
+    for (let i=0;i<candles.length;i++){
+      if (!running) break; // allow stop
+
+      // compute crossover at this close
+      const fe = fastEMA[i], se = slowEMA[i], ri = rsi[i];
+      if (fe == null || se == null || ri == null) continue;
+
+      // determine signal at close
+      let signal = null; // 'long'|'short'|null
+      if (fe > se && ri > rsiOS) signal = 'long';
+      else if (fe < se && ri < rsiOB) signal = 'short';
+
+      if (signal) {
+        const price = candles[i].close;
+        const time = candles[i].time;
+
+        // if no position => open
+        if (!currentPos) {
+          // simulate order placement or call backend
+          if (mode === 'live') {
+            // send to backend to place real order (you need server side with auth)
+            try {
+              await placeOrderToBackend({ action:'open', side:signal, price, time });
+            } catch (err) {
+              // handle order error (skip opening)
+              console.error('open order failed, skipping', err);
+              continue;
+            }
+          }
+          // simulate: create position; simple units calc: percent of equity (1.0 => 100%)
+          const units = (initialCapital) / price; // using all capital for simple example
+          currentPos = { side: signal, entry_time: time, entry_price: price, units, entry_fee: feePct/100 * units*price };
+          log('OPEN', signal, price, new Date(time*1000).toLocaleString());
+        } else if (currentPos.side !== signal) {
+          // opposite signal: close current and open new at same price/time
+          // close current
+          const exitPrice = price;
+          const exitTime = time;
+          // compute pnl depending on long/short
+          let pnl;
+          if (currentPos.side === 'long') {
+            pnl = currentPos.units * (exitPrice - currentPos.entry_price) - (currentPos.entry_fee + (feePct/100)*currentPos.units*exitPrice);
+          } else {
+            // short: we received proceeds at entry, pay buyback now
+            pnl = (currentPos.entry_price*currentPos.units) - (exitPrice*currentPos.units) - (currentPos.entry_fee + (feePct/100)*currentPos.units*exitPrice);
+          }
+          // record trade
+          const trade = {
+            side: currentPos.side === 'long' ? 'Long' : 'Short',
+            entry_time: currentPos.entry_time,
+            entry_price: currentPos.entry_price,
+            exit_time: exitTime,
+            exit_price: exitPrice,
+            units: currentPos.units,
+            pnl
+          };
+          trades.push(trade);
+          renderTrades();
+          attachMarkersFromTrades(trades);
+
+          // optionally send close order to backend
+          if (mode === 'live') {
+            try { await placeOrderToBackend({ action:'close', side:currentPos.side, price: exitPrice, time: exitTime }); }
+            catch(e){ console.error('close order failed', e); }
+          }
+
+          // open new opposite
+          if (mode === 'live') {
+            try { await placeOrderToBackend({ action:'open', side:signal, price, time }); }
+            catch(e){ console.error('open new failed', e); continue; }
+          }
+          const newUnits = (initialCapital) / price;
+          currentPos = { side: signal, entry_time: time, entry_price: price, units:newUnits, entry_fee: feePct/100 * newUnits*price };
+          log('SWITCH: closed and opened', signal, price, new Date(time*1000).toLocaleString());
+        } else {
+          // same-side signal (ignore, we already in position)
+        }
+        // draw EMA lines up-to-date for visibility
+        const emaFastPoints = candles.map((c, idx)=> ({ time: c.time, value: fastEMA[idx] })).filter(p=>p.value!=null);
+        const emaSlowPoints = candles.map((c, idx)=> ({ time: c.time, value: slowEMA[idx] })).filter(p=>p.value!=null);
+        fastSeries.setData(emaFastPoints);
+        slowSeries.setData(emaSlowPoints);
+      }
+
+      // optional small delay to emulate streaming / live stepping (remove or set to 0)
+      await sleep(0); // immediate
+    }
+
+    // end run - if a position still open, we leave it open or choose to close at last bar:
+    // (we DO NOT auto-close here to match "live" behavior). If you want auto-close at end:
+    // if (currentPos) { ... close at last close ... }
+
+    renderTrades();
+    attachMarkersFromTrades(trades);
+    log('run complete, trades:', trades.length);
+  }
+
+  // ---------- UI controls ----------
+  startBtn.addEventListener('click', ()=> {
+    if (running) return;
+    running = true;
+    trades = [];
+    currentPos = null;
+    seriesMarkers && seriesMarkers.setMarkers([]);
+    tradesTbody.innerHTML = '';
+    runStrategyOnce();
+  });
+  stopBtn.addEventListener('click', ()=> { running = false; });
+
+  function renderTrades(){
+    tradesTbody.innerHTML = '';
+    if (!trades.length) { tradesTbody.innerHTML = '<tr><td colspan="5" class="muted">No trades</td></tr>'; return; }
+    let idx=0;
+    for (const t of trades){
+      idx++;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${idx}</td><td>${t.side==='Long'?'<span class="L">L</span>':'<span class="S">S</span>'}</td>
+        <td>${new Date(t.entry_time*1000).toLocaleString()}</td><td>${t.entry_price.toFixed(2)}</td>
+        <td>${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}</td>`;
+      tradesTbody.appendChild(tr);
+      const tr2=document.createElement('tr');
+      tr2.innerHTML = `<td></td><td></td><td>${new Date(t.exit_time*1000).toLocaleString()}</td><td>${t.exit_price.toFixed(2)}</td><td></td>`;
+      tradesTbody.appendChild(tr2);
+    }
+  }
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,370 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EMA-RSI Walkforward Visualizer</title>
+
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    html,body{height:100%;margin:0;background:#071226;color:#dfeeff;font-family:system-ui,Arial}
+    .wrap{display:flex;height:100vh}
+    .left{flex:1;padding:8px;display:flex;flex-direction:column;gap:8px}
+    .chart-wrap{flex:1;display:flex;flex-direction:column;gap:8px}
+    .chart-top{height:calc(70% - 8px);background:#071226;border-radius:6px;overflow:hidden}
+    .chart-bottom{height:calc(30% - 8px);background:#071226;border-radius:6px;overflow:hidden}
+    .right{width:360px;background:#04141f;padding:12px;border-left:1px solid #063248;box-sizing:border-box;display:flex;flex-direction:column}
+    #priceChart{height:100%}
+    #equityChart{height:100%}
+    .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    label{width:120px;color:#9fc7db}
+    input[type=number], select {background:#07212a;border:1px solid #063248;padding:6px 8px;border-radius:6px;color:#dfeeff}
+    button{background:#2dd4bf;border:none;padding:8px 10px;border-radius:6px;color:#042;font-weight:700;cursor:pointer}
+    .muted{color:#9fc7db;font-size:13px}
+    .trades{margin-top:8px;background:#021418;padding:8px;border-radius:6px;max-height:36vh;overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{padding:6px 8px;border-bottom:1px dashed rgba(255,255,255,0.03);text-align:left}
+    th{color:#9fc7db}
+    .L{color:#7cf2a6;font-weight:700}
+    .S{color:#ff9b9b;font-weight:700}
+    .stat{margin-bottom:6px}
+    .warn{color:#ffcc66;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left">
+      <div class="chart-wrap">
+        <div id="pricePanel" class="chart-top"><div id="priceChart" style="height:100%"></div></div>
+        <div id="equityPanel" class="chart-bottom"><div id="equityChart" style="height:100%"></div></div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="row">
+        <div style="font-weight:700">EMA(9/21) + RSI walkforward</div>
+        <div style="margin-left:auto" class="muted">Backend-seeded, minute-execution</div>
+      </div>
+
+      <div class="row"><label>Hours window</label><input id="hours" type="number" value="12" min="1" /></div>
+      <div class="row"><label>Fast EMA</label><input id="fast" type="number" value="9" min="1" /></div>
+      <div class="row"><label>Slow EMA</label><input id="slow" type="number" value="21" min="1" /></div>
+      <div class="row"><label>RSI length</label><input id="rsiLen" type="number" value="14" min="1" /></div>
+      <div class="row"><label>RSI overbought</label><input id="rsiOB" type="number" value="65" /></div>
+      <div class="row"><label>RSI oversold</label><input id="rsiOS" type="number" value="35" /></div>
+
+      <div class="row"><label>Initial capital</label><input id="initCapital" type="number" value="1000" /></div>
+      <div class="row"><label>Fee %</label><input id="fee" type="number" step="0.01" value="0.1" /></div>
+
+      <div class="row">
+        <label>Mode</label>
+        <select id="mode">
+          <option value="simulate">Simulate (local)</option>
+          <option value="live">Live (POST /place_order)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <button id="startBtn">Run Walkforward</button>
+        <button id="stopBtn" style="background:#ff7b7b;margin-left:6px">Stop</button>
+      </div>
+
+      <div id="seedWarn" class="muted" style="margin-bottom:6px"></div>
+      <div id="statsBox" class="muted"></div>
+
+      <div style="margin-top:8px" class="muted">Trades (entry then exit rows)</div>
+      <div class="trades">
+        <table id="tradesTable">
+          <thead><tr><th>#</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+(async function(){
+  // ---------- basic endpoints ----------
+  const BASE = "http://127.0.0.1:8000";
+  const candlesEndpoint = (days) => `${BASE}/candles?symbol=BTCIRT&resolution=60&days=${days}`;
+  const walkforwardEndpoint = (params) => {
+    const q = new URLSearchParams(params);
+    return `${BASE}/walkforward?` + q.toString();
+  };
+  const intraminuteBacktestEndpoint = (params) => {
+    const q = new URLSearchParams(params);
+    return `${BASE}/intraminute_backtest?` + q.toString();
+  };
+  const placeOrderUrl = `${BASE}/place_order`;
+
+  const log = (...a)=>console.log(...a);
+  const sleep = ms=>new Promise(r=>setTimeout(r,ms));
+
+  // ---------- chart setup (price + equity) ----------
+  const priceChart = LightweightCharts.createChart(document.getElementById('priceChart'), {
+    layout:{background:'#071226', textColor:'#dfeeff'},
+    grid:{vertLines:{color:'rgba(255,255,255,0.03)'}, horzLines:{color:'rgba(255,255,255,0.03)'}},
+    rightPriceScale:{borderColor:'#063248'},
+    timeScale:{timeVisible:true, secondsVisible:false}
+  });
+  const candleSeries = priceChart.addSeries(LightweightCharts.CandlestickSeries);
+  const emaFastSeries = priceChart.addSeries(LightweightCharts.LineSeries, { color:'#58a6ff', lineWidth:1.5 });
+  const emaSlowSeries = priceChart.addSeries(LightweightCharts.LineSeries, { color:'#ffb86b', lineWidth:1.5 });
+
+  const equityChart = LightweightCharts.createChart(document.getElementById('equityChart'), {
+    layout:{background:'#071226', textColor:'#dfeeff'},
+    rightPriceScale:{borderColor:'#063248'},
+    timeScale:{timeVisible:true, secondsVisible:false}
+  });
+  const equitySeries = equityChart.addSeries(LightweightCharts.LineSeries, { priceFormat:{type:'price', precision:2}, lineWidth:2 });
+
+  let markersSeries = candleSeries;
+
+  // ---------- UI elements ----------
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const hoursIn = document.getElementById('hours');
+  const fastIn = document.getElementById('fast');
+  const slowIn = document.getElementById('slow');
+  const rsiLenIn = document.getElementById('rsiLen');
+  const rsiOBIn = document.getElementById('rsiOB');
+  const rsiOSIn = document.getElementById('rsiOS');
+  const initCapIn = document.getElementById('initCapital');
+  const feeIn = document.getElementById('fee');
+  const modeSel = document.getElementById('mode');
+  const tradesTbody = document.querySelector('#tradesTable tbody');
+  const seedWarn = document.getElementById('seedWarn');
+  const statsBox = document.getElementById('statsBox');
+
+  let running = false;
+  let intervalId = null;
+  let currentTrades = [];
+  let previousMarkers = [];
+
+  // ---------- util: compute EMA client-side (seed with SMA of first `period`) ----------
+  function computeEMAValues(hourlyCandles, period){
+    // returns array aligned with hourlyCandles: {time,value} where value may be null until period-1
+    const closes = hourlyCandles.map(h=>h.close);
+    const n = closes.length;
+    const out = new Array(n).fill(null);
+    if (n === 0) return out;
+    const k = 2/(period+1);
+    if (n < period){
+      // simple iterative seed
+      let ema = closes[0];
+      out[0] = null;
+      for (let i=1;i<n;i++){
+        ema = closes[i]*k + ema*(1-k);
+        out[i] = ema;
+      }
+      return out;
+    }
+    // seed with SMA of first period
+    let seed = 0;
+    for (let i=0;i<period;i++) seed += closes[i];
+    seed = seed / period;
+    let ema = seed;
+    // first period-1 indices remain null to match common chart behavior
+    for (let i=0;i<period-1;i++) out[i] = null;
+    out[period-1] = ema;
+    for (let i=period;i<n;i++){
+      ema = closes[i]*k + ema*(1-k);
+      out[i] = ema;
+    }
+    return out;
+  }
+
+  function renderTradesTable(trades){
+    tradesTbody.innerHTML = '';
+    if (!trades || trades.length === 0){
+      tradesTbody.innerHTML = '<tr><td colspan="5" class="muted">No trades</td></tr>';
+      return;
+    }
+    let idx = 0;
+    for (const t of trades){
+      idx++;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${idx}</td>
+        <td>${t.side}</td>
+        <td>${new Date(t.entry_time*1000).toLocaleString()}</td>
+        <td>${t.exit_time ? new Date(t.exit_time*1000).toLocaleString() : '-'}</td>
+        <td>${(t.pnl>=0?'+':'') + (t.pnl||0).toFixed(2)}</td>`;
+      tradesTbody.appendChild(tr);
+    }
+  }
+
+  function attachMarkers(markers){
+    // markers: [{time, position, color, shape, text}]
+    if (!markers || !markers.length) {
+      markersSeries.setMarkers([]);
+      return;
+    }
+    const m = markers.map(mt => ({
+      time: mt.time,
+      position: mt.position || 'belowBar',
+      color: mt.color || (mt.text === 'L' ? 'green' : 'red'),
+      shape: mt.shape || 'circle',
+      text: mt.text || (mt.position === 'belowBar' ? 'L' : 'S')
+    }));
+    markersSeries.setMarkers(m);
+  }
+
+  async function placeOrder(payload) {
+    try {
+      const r = await fetch(placeOrderUrl, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json();
+      console.log('Order placed:', j);
+    } catch (err) {
+      console.error('Place order failed:', err);
+    }
+  }
+
+  // ---------- main run (walkforward + render) ----------
+  async function fetchAndRender(isLive = false, endpoint, params, hourlyFromEndpoint = false) {
+    try {
+      const r2 = await fetch(endpoint(params));
+      const j2 = await r2.json();
+
+      let hourly;
+      if (hourlyFromEndpoint) {
+        hourly = (j2.hourly || []).map(c => ({ time: c.time, open:+c.open, high:+c.high, low:+c.low, close:+c.close }));
+      } else {
+        // Fetch hourly separately if not in response
+        const r1 = await fetch(candlesEndpoint(params.days_back_for_history || params.days));
+        const j1 = await r1.json();
+        hourly = (j1.candles || []).map(c => ({ time: c.time, open:+c.open, high:+c.high, low:+c.low, close:+c.close }));
+      }
+
+      // warn if not enough hourly history
+      const maxPeriod = Math.max(params.fast, params.slow, params.rsi_len);
+      if (hourly.length < maxPeriod * 3){
+        seedWarn.innerHTML = `<div class="warn">Warning: only ${hourly.length} hourly bars available — recommended >= ${maxPeriod * 3} hours for stable EMA/RSI seeding</div>`;
+      } else {
+        seedWarn.innerHTML = `<div class="muted">Seed history: ${hourly.length} hourly bars (recommended >= ${maxPeriod*3})</div>`;
+      }
+
+      const trades = j2.trades || [];
+      let markers = j2.markers || [];
+      const equity = j2.equity || [];
+      const stats = j2.stats || {};
+
+      // set candlestick data
+      if (hourly && hourly.length) {
+        candleSeries.setData(hourly);
+        priceChart.timeScale().fitContent();
+      }
+
+      // compute and plot EMA lines over hourly candles (client-side so visuals match)
+      const emaFastArr = computeEMAValues(hourly, params.fast).map((val, idx) => val==null?null:{ time: hourly[idx].time, value: val });
+      const emaSlowArr = computeEMAValues(hourly, params.slow).map((val, idx) => val==null?null:{ time: hourly[idx].time, value: val });
+      emaFastSeries.setData(emaFastArr.filter(x=>x && x.value!=null));
+      emaSlowSeries.setData(emaSlowArr.filter(x=>x && x.value!=null));
+
+      // attach markers (minute accurate timestamps returned by backend)
+      attachMarkers(markers);
+
+      // equity plot (minute resolution). backend returns array of {time, equity}
+      equitySeries.setData((equity || []).map(e => ({ time: e.time, value: e.equity })));
+      equityChart.timeScale().fitContent();
+
+      // render stats and trades
+      currentTrades = trades;
+      renderTradesTable(trades);
+
+      statsBox.innerHTML = `<div class="stat">Trades: ${stats.trades || 0}</div>
+        <div class="stat">Net PnL: ${ (stats.net_profit||0).toFixed(2) }</div>
+        <div class="stat">Final Equity: ${ (stats.final_equity||0).toFixed(2) }</div>
+        <div class="stat">Max Drawdown: ${ (stats.max_drawdown_pct||0).toFixed(2) }%</div>`;
+
+      // For live: check for new markers and place orders
+      if (isLive) {
+        if (markers.length > previousMarkers.length) {
+          const newMarkers = markers.slice(previousMarkers.length);
+          for (const marker of newMarkers) {
+            const action = marker.position === 'aboveBar' ? 'close' : 'open';
+            const side = marker.text === 'L' ? 'long' : 'short';
+            const payload = {
+              symbol: 'BTCIRT',
+              action: action,
+              side: side,
+              time: marker.time,
+              // Price not available directly; for testing, omit or fetch separately if needed
+            };
+            await placeOrder(payload);
+          }
+        }
+        previousMarkers = [...markers];
+      }
+
+    } catch (err){
+      console.error(err);
+      alert('Run failed: ' + (err.message || err));
+    }
+  }
+
+  async function run() {
+    running = true;
+    startBtn.disabled = true;
+    seedWarn.textContent = '';
+    statsBox.innerHTML = '';
+    renderTradesTable([]);
+    previousMarkers = [];
+
+    const fast = Number(fastIn.value) || 9;
+    const slow = Number(slowIn.value) || 21;
+    const rsiLen = Number(rsiLenIn.value) || 14;
+    const rsiOB = Number(rsiOBIn.value) || 65;
+    const rsiOS = Number(rsiOSIn.value) || 35;
+    const hoursWindow = Number(hoursIn.value) || 12;
+    const initialCapital = Number(initCapIn.value) || 1000;
+    const feePct = Number(feeIn.value) || 0.1;
+
+    // minimal days to fetch for seeding = ceil(maxPeriod*3 / 24)
+    const maxPeriod = Math.max(fast, slow, rsiLen);
+    const daysNeeded = Math.max(1, Math.ceil((maxPeriod * 3) / 24) + 1); // +1 for safety
+
+    const params = {
+      symbol: 'BTCIRT',
+      fast: fast,
+      slow: slow,
+      rsi_len: rsiLen,
+      rsi_ob: rsiOB,
+      rsi_os: rsiOS,
+      initial_capital: initialCapital,
+      fee_pct: feePct,
+      position_size_pct: 1.0,
+      days_back_for_history: daysNeeded
+    };
+
+    if (modeSel.value === 'simulate') {
+      params.hours = hoursWindow;
+      await fetchAndRender(false, walkforwardEndpoint, params);
+      startBtn.disabled = false;
+      running = false;
+    } else if (modeSel.value === 'live') {
+      // For live, use intraminute_backtest for current hour to detect new signals
+      params.days = daysNeeded;
+      await fetchAndRender(true, intraminuteBacktestEndpoint, params, true); // hourly from endpoint
+      intervalId = setInterval(async () => {
+        if (!running) return;
+        await fetchAndRender(true, intraminuteBacktestEndpoint, params, true);
+      }, 60000); // Poll every 60 seconds for current hour
+    }
+  }
+
+  startBtn.addEventListener('click', () => { if (!running) run(); });
+  stopBtn.addEventListener('click', () => {
+    running = false;
+    if (intervalId) clearInterval(intervalId);
+    intervalId = null;
+    startBtn.disabled = false;
+  });
+
+})();
+</script>
+</body>
+</html>

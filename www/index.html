@@ -1,0 +1,80 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>EMA-RSI Visualizer — Modular</title>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    html,body{height:100%;margin:0;background:#071226;color:#dfeeff;font-family:system-ui,Arial}
+    .wrap{display:flex;height:100vh}
+    .left{flex:1;padding:8px;display:flex;flex-direction:column;gap:8px}
+    .chart-wrap{flex:1;display:flex;flex-direction:column;gap:8px}
+    .chart-top{flex:1;background:#071226;border-radius:6px;overflow:hidden}
+    .chart-bottom{height:200px;background:#071226;border-radius:6px;overflow:hidden}
+    .right{width:360px;background:#04141f;padding:12px;border-left:1px solid #063248;box-sizing:border-box;display:flex;flex-direction:column}
+    #priceChart{height:100%}
+    #equityChart{height:100%}
+    .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+    label{width:120px;color:#9fc7db}
+    input[type=number], input[type=text], select {background:#07212a;border:1px solid #063248;padding:6px 8px;border-radius:6px;color:#dfeeff}
+    button{background:#2dd4bf;border:none;padding:8px 10px;border-radius:6px;color:#042;font-weight:700;cursor:pointer}
+    .muted{color:#9fc7db;font-size:13px}
+    .trades{margin-top:8px;background:#021418;padding:8px;border-radius:6px;max-height:36vh;overflow:auto}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{padding:6px 8px;border-bottom:1px dashed rgba(255,255,255,0.03);text-align:left}
+    th{color:#9fc7db}
+    .warn{color:#ffcc66;font-weight:700}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="left">
+      <div class="chart-wrap">
+        <div id="pricePanel" class="chart-top"><div id="priceChart"></div></div>
+        <div id="equityPanel" class="chart-bottom"><div id="equityChart"></div></div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="row"><div style="font-weight:700">EMA(9/21) + RSI Visualizer (modular)</div></div>
+
+      <div class="row"><label>Mode</label>
+        <select id="mode">
+          <option value="new">Hourly Backtest (new intraminute)</option>
+          <option value="conventional">Conventional Hourly Backtest (Pine-like)</option>
+          <option value="intrahour">Intrahour Signals (server /intraminute_backtest)</option>
+          <option value="live">Live (poll intrahour & POST /place_order)</option>
+        </select>
+      </div>
+
+      <div class="row"><label>Days</label><input id="days" type="number" value="2" min="1" /></div>
+      <div class="row"><label>Short EMA</label><input id="short" type="number" value="9" min="1" /></div>
+      <div class="row"><label>Long EMA</label><input id="long" type="number" value="21" min="1" /></div>
+      <div class="row"><label>Initial capital</label><input id="initCapital" type="number" value="1000" /></div>
+      <div class="row"><label>Fee %</label><input id="fee" type="number" step="0.01" value="0.1" /></div>
+
+      <div class="row"><label>Start (ISO UTC)</label><input id="startISO" type="text" value="2025-08-01T12:00:00Z" /></div>
+      <div class="row"><label>End (ISO UTC)</label><input id="endISO" type="text" value="2026-09-01T00:00:00Z" /></div>
+
+      <div class="row">
+        <button id="runBtn">Run</button>
+        <button id="stopBtn" style="background:#ff7b7b;margin-left:6px">Stop</button>
+      </div>
+
+      <div id="seedWarn" class="muted" style="margin-bottom:6px"></div>
+      <div id="statsBox" class="muted"></div>
+
+      <div style="margin-top:8px" class="muted">Trades / Signals</div>
+      <div class="trades">
+        <table id="tradesTable">
+          <thead><tr><th>#</th><th>Type</th><th>Time</th><th>Price</th><th>P&L</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- run.js is the entrypoint module which imports others -->
+  <script type="module" src="js/run.js"></script>
+</body>
+</html>
